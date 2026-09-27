@@ -496,7 +496,7 @@ static NSString *S3StatusLine(UIViewController *vc, NSString *verdict) {
     S3ImageStats(&fix, &host);
     UIResponder *input = S3InputIn(vc);
     NSString *kbDump = nil;
-    UIWindow *kb = S3FindKeyboardWindow(&kbDump);
+    (void)S3FindKeyboardWindow(&kbDump);   // 结果只用来写文字，窗口本身不需要
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"S3Fix %@ hook=%d 补丁镜像=%d份%@\n", kS3Ver, gHookState, fix,
      fix > 1 ? @" ⚠️重复注入" : @""];
