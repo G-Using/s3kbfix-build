@@ -1,4 +1,4 @@
-// S3TextKeyboardFix 1.6.6 —— 让「截图标记」的文字标注面板能弹出系统原生键盘
+// S3TextKeyboardFix 1.6.7 —— 让「截图标记」的文字标注面板能弹出系统原生键盘
 //
 // ─────────────────────────────────────────────────────────────────────────
 // 一、真正的病因（反汇编 biaoji.dylib 与 1.6.2 / 1.6.3 两个 fix dylib 得出）
@@ -34,6 +34,11 @@
 //       没出现就继续重试（resign + reloadInputViews + become）；
 //   [5] 全程落盘日志 + 每次打印窗口层级快照；万一还不行，日志能直接定位；
 //   [6] 面板消失 / VC 被销毁 → 还原标注窗口层级。
+//   [7] 1.6.7 追加「自证身份」：日志开头打印本 dylib 的真实加载路径 + 版本，
+//       并列出进程内所有 S3TextKeyboardFix / biaoji 相关镜像。
+//       原因：RootHide 下 /usr/lib/TweakInject 与 Library/MobileSubstrate/DynamicLibraries
+//       两边都可能有同名 dylib，且有 *.roothidepatch 补丁缓存，
+//       「装了新包但跑的是旧代码」这种情况只能靠日志自证。
 //
 //   只用运行时按类名找 S3TextEditViewController，与 dylib 加载顺序无关。
 // ─────────────────────────────────────────────────────────────────────────
@@ -41,9 +46,17 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
 #include <stdarg.h>
 
 #define kLogPath @"/var/mobile/Documents/S3TextKeyboardFix.log"
+
+// 版本号 + 自证身份：RootHide 会缓存 dylib 的补丁副本（*.roothidepatch），
+// 而且 /usr/lib/TweakInject 与 /Library/MobileSubstrate/DynamicLibraries 两边
+// 都可能存在同名文件。所以启动时必须把「到底加载了哪一份、哪个版本」写进日志，
+// 否则「装了新包但跑的是旧代码」这种情况根本看不出来。
+static NSString *const kS3Ver = @"1.6.7";
 
 // 必须严格小于 UITextEffectsWindow 的 10.0。
 // 1.0 高于普通窗口(0)，保证标注 UI 仍盖在桌面/图标之上。
@@ -56,7 +69,7 @@ static void S3Log(NSString *fmt, ...) {
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[S3TextFix] %@\n", s];
+    NSString *line = [NSString stringWithFormat:@"[S3TextFix %@] %@\n", kS3Ver, s];
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:kLogPath]) {
         [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
@@ -66,6 +79,34 @@ static void S3Log(NSString *fmt, ...) {
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     }
+}
+
+// ───────────────────────── 自证身份（排查"装了不生效"用） ─────────────────────────
+// 打印本 dylib 自己的真实加载路径，以及进程里所有和本插件相关的已加载镜像。
+// 若这里出现两份不同路径的 S3TextKeyboardFix.dylib，说明被注入了两次
+// （RootHide 下 /usr/lib/TweakInject 与 Library/MobileSubstrate/DynamicLibraries 都有副本）。
+static NSString *S3SelfPath(void) {
+    Dl_info info;
+    const char *p = "?";
+    // 函数指针 → uintptr_t → void*，避免 C/C++ 下函数指针直接转对象指针的问题
+    if (dladdr((void *)(uintptr_t)&S3Log, &info) && info.dli_fname) p = info.dli_fname;
+    return [NSString stringWithUTF8String:p];
+}
+
+static NSString *S3LoadedImages(void) {
+    NSMutableString *s = [NSMutableString string];
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        NSString *f = [NSString stringWithUTF8String:nm];
+        if (!f) continue;
+        if ([f containsString:@"S3TextKeyboardFix"] || [f containsString:@"biaoji"]) {
+            [s appendFormat:@"\n      %@", f];
+        }
+    }
+    if (s.length == 0) return @"（一个都没加载？）";
+    return s;
 }
 
 // ───────────────────────────── 状态 ─────────────────────────────
@@ -328,11 +369,13 @@ static void S3InstallHook(void) {
         S3Log(@"已 hook viewDidDisappear:");
     }
 
-    S3Log(@"hook 安装完成 on S3TextEditViewController");
+    S3Log(@"hook 安装完成 on S3TextEditViewController（本份来自 %@）", S3SelfPath());
 }
 
 __attribute__((constructor)) static void S3Init(void) {
-    S3Log(@"----- S3TextKeyboardFix v6（原生键盘 / 层级 < 10）loaded (pid=%d) -----", getpid());
+    S3Log(@"===== v%@ 已加载 pid=%d =====", kS3Ver, getpid());
+    S3Log(@"自身路径: %@", S3SelfPath());
+    S3Log(@"进程内相关镜像: %@", S3LoadedImages());
     dispatch_async(dispatch_get_main_queue(), ^{
         S3InstallHook();
 
