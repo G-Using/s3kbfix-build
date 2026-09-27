@@ -55,7 +55,6 @@ jobs:
         run: |
           export PATH="$HOME/theos/bin:$PATH"
           export THEOS="$HOME/theos"
-          chmod +x layout/DEBIAN/postinst
           ls "$THEOS/makefiles/common.mk"
           make package FINALPACKAGE=1
           ls -l packages
