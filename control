@@ -1,0 +1,9 @@
+Package: com.huayuarc.s3kbfix.cloud
+Name: S3 Keyboard Fix (cloud build only)
+Description: 只用于云端编译出 S3TextKeyboardFix.dylib，最终 deb 由本地合并。
+Maintainer: G-Using
+Author: G-Using
+Section: Tweaks
+Depends: firmware (>= 14.0), mobilesubstrate
+Architecture: iphoneos-arm64
+Version: 1.6.6
