@@ -1,46 +1,43 @@
 // S3TextKeyboardFix 1.6.7 —— 让「截图标记」的文字标注面板能弹出系统原生键盘
 //
 // ─────────────────────────────────────────────────────────────────────────
-// 一、真正的病因（反汇编 biaoji.dylib 与 1.6.2 / 1.6.3 两个 fix dylib 得出）
+// 一、结论先行：不要去动窗口层级
 //
-// biaoji.dylib（1.6.2 与 1.6.3 两版字节完全相同）里创建标注窗口：
+// 现场数据（1.6.2 / 1.6.3 两个包在真机上的表现）：
 //
-//     w = [[UIWindow alloc] initWithWindowScene:scene];
-//     w.windowLevel = UIWindowLevelStatusBar + 1;      // = 1001   ← 罪魁
-//     [w makeKeyWindow];
+//   1.6.2：自绘键盘显示出来了，**原生键盘同时也弹出来了**（只是自绘键盘收不掉）。
+//          biaoji 的标注窗口此时还是 UIWindowLevelStatusBar + 1 = 1001。
+//   1.6.3：删掉自绘键盘，改成把标注窗口 setWindowLevel:10。
+//          直接装 1.6.3 → 键盘不出来。
 //
-// 文字面板的输入框是标准 UITextField（tag = 200）、没有自定义 inputView，
-// 所以「光标在闪但没有键盘」只可能是一个原因：键盘弹出来了，但被标注窗口盖住。
-// 系统真正承载键盘的窗口是 UITextEffectsWindow，它的 windowLevel == 10。
+// 1.6.2 这条事实是决定性的：**标注窗口在 1001 的时候，原生键盘照样能显示。**
+// 也就是说「层级 1001 把键盘压住了」这个假设是错的 —— 真正承载键盘的窗口层级远高于 1001，
+// 标注窗口的层级对它没有影响。所以 1.6.3 花大力气把窗口压到 10，不但没用，还很可能是**致病的**：
 //
-//   1.6.2（自绘键盘版）：另开一个 UIWindow（同一个 windowScene），
-//        windowLevel = 标注窗口.level + 2 = 1003，把自绘键盘塞进去
-//        → 1003 > 10，看得见 → 能用（代价是要自绘键盘）。
+//   运行中改 UIWindow.windowLevel 会让窗口在窗口列表里被重新排序/重建，
+//   第一响应者可能被顺手丢掉（UIKit 上有名的坑），于是「刚 become 成功、马上又没了」，
+//   表现出来就是——有光标，但键盘不出现。
 //
-//   1.6.3（原生键盘版）：把标注窗口 setWindowLevel:10。
-//        反汇编确认就是 `fmov d0, #10.0` → setWindowLevel:。
-//        **10 与 UITextEffectsWindow 撞层**。同层时 z 序按创建顺序决定，
-//        而 UITextEffectsWindow 早就存在、标注窗口是新建的 → 标注窗口仍在上面
-//        → 键盘继续被盖住 → 依旧是「有光标、没键盘」。
+// 所以 1.6.7 的主路径**完全不碰 windowLevel**：
+//   只做「等 VC 进窗口 → 标注窗口 makeKeyWindow → 输入框 becomeFirstResponder」，
+//   失败就重试，直到系统真的发出 UIKeyboardDidShow。
+//   层级调整降级为**最后手段**：只有等到重试都打完、键盘仍然没出现时才做一次，
+//   键盘一旦出现就不再动它，面板消失时还原。
 //
-// 所以 1.6.3 / 1.6.4 / 1.6.5 都无效，根因是那个 10 定错了。
+// 二、输入框的情况（反汇编 biaoji.dylib 确认）
+//   - 文字面板输入框是标准 UITextField，tag = 0xC8 = 200，**没有自定义 inputView**；
+//   - 面板容器 tag = 999，在屏幕底部，键盘弹出正好会盖住「取消 / 确认」
+//     → 需要对容器做 transform 上移，收起时复位；
+//   - biaoji 自己的 -ensureTextKeyboard 只做两件事：
+//         if (self.view.window && !self.view.window.isKeyWindow) [self.view.window makeKeyWindow];
+//         dispatch_async(main, ^{ tf = [self.view viewWithTag:200]; [tf becomeFirstResponder]; });
+//     关键缺陷：**只在 dispatch_async 里试一次，窗口/视图还没就位就直接失败**，没有重试。
+//     1.6.7 补的就是这个：同样的事，但重复做、每次都验证键盘是否真的出现。
 //
-// 二、1.6.6 的修法
-//   [1] 标注窗口层级压到 1.0（严格小于 10），而且必须在任何 becomeFirstResponder 之前；
-//   [2] 不依赖「按类名枚举键盘窗口」—— iOS 16 起 UIRemoteKeyboardWindow 已不在
-//       UIApplication.windows 里。改为：只把 level <= 1 的文字效果类窗口抬到 2，找不到不动手；
-//   [3] 顺序修正：先压层级 → 再调原实现 → 再异步校验重试；
-//   [4] 用 UIKeyboardWillShow / DidShow 通知反过来确认键盘到底有没有出现，
-//       没出现就继续重试（resign + reloadInputViews + become）；
-//   [5] 全程落盘日志 + 每次打印窗口层级快照；万一还不行，日志能直接定位；
-//   [6] 面板消失 / VC 被销毁 → 还原标注窗口层级。
-//   [7] 1.6.7 追加「自证身份」：日志开头打印本 dylib 的真实加载路径 + 版本，
-//       并列出进程内所有 S3TextKeyboardFix / biaoji 相关镜像。
-//       原因：RootHide 下 /usr/lib/TweakInject 与 Library/MobileSubstrate/DynamicLibraries
-//       两边都可能有同名 dylib，且有 *.roothidepatch 补丁缓存，
-//       「装了新包但跑的是旧代码」这种情况只能靠日志自证。
-//
-//   只用运行时按类名找 S3TextEditViewController，与 dylib 加载顺序无关。
+// 三、自证身份（RootHide 下排查「装了新包却在跑旧代码」）
+//   RootHide 的 /usr/lib/TweakInject 与 Library/MobileSubstrate/DynamicLibraries 两边
+//   都可能有同名 dylib，另有 *.roothidepatch 补丁缓存。所以启动时把
+//   「本 dylib 的真实加载路径 + 版本 + 进程内所有相关镜像」写进日志，一看便知。
 // ─────────────────────────────────────────────────────────────────────────
 
 #import <UIKit/UIKit.h>
@@ -52,16 +49,10 @@
 
 #define kLogPath @"/var/mobile/Documents/S3TextKeyboardFix.log"
 
-// 版本号 + 自证身份：RootHide 会缓存 dylib 的补丁副本（*.roothidepatch），
-// 而且 /usr/lib/TweakInject 与 /Library/MobileSubstrate/DynamicLibraries 两边
-// 都可能存在同名文件。所以启动时必须把「到底加载了哪一份、哪个版本」写进日志，
-// 否则「装了新包但跑的是旧代码」这种情况根本看不出来。
 static NSString *const kS3Ver = @"1.6.7";
 
-// 必须严格小于 UITextEffectsWindow 的 10.0。
-// 1.0 高于普通窗口(0)，保证标注 UI 仍盖在桌面/图标之上。
-static const CGFloat kAnnoLowLevel = 1.0;
-static const CGFloat kKbMinLevel  = 2.0;
+// 最后手段才会用到的层级。正常路径完全不碰 windowLevel。
+static const CGFloat kAnnoFallbackLevel = 1.0;
 
 // ───────────────────────────── 日志 ─────────────────────────────
 static void S3Log(NSString *fmt, ...) {
@@ -81,14 +72,11 @@ static void S3Log(NSString *fmt, ...) {
     }
 }
 
-// ───────────────────────── 自证身份（排查"装了不生效"用） ─────────────────────────
-// 打印本 dylib 自己的真实加载路径，以及进程里所有和本插件相关的已加载镜像。
-// 若这里出现两份不同路径的 S3TextKeyboardFix.dylib，说明被注入了两次
-// （RootHide 下 /usr/lib/TweakInject 与 Library/MobileSubstrate/DynamicLibraries 都有副本）。
+// ───────────────────── 自证身份：本 dylib 到底是谁 ─────────────────────
 static NSString *S3SelfPath(void) {
     Dl_info info;
     const char *p = "?";
-    // 函数指针 → uintptr_t → void*，避免 C/C++ 下函数指针直接转对象指针的问题
+    // 函数指针 → uintptr_t → void*：避免 C/C++ 下函数指针直接转对象指针的问题
     if (dladdr((void *)(uintptr_t)&S3Log, &info) && info.dli_fname) p = info.dli_fname;
     return [NSString stringWithUTF8String:p];
 }
@@ -96,6 +84,7 @@ static NSString *S3SelfPath(void) {
 static NSString *S3LoadedImages(void) {
     NSMutableString *s = [NSMutableString string];
     uint32_t n = _dyld_image_count();
+    int hits = 0;
     for (uint32_t i = 0; i < n; i++) {
         const char *nm = _dyld_get_image_name(i);
         if (!nm) continue;
@@ -103,9 +92,10 @@ static NSString *S3LoadedImages(void) {
         if (!f) continue;
         if ([f containsString:@"S3TextKeyboardFix"] || [f containsString:@"biaoji"]) {
             [s appendFormat:@"\n      %@", f];
+            hits++;
         }
     }
-    if (s.length == 0) return @"（一个都没加载？）";
+    if (hits == 0) return @"（一个都没加载？）";
     return s;
 }
 
@@ -113,9 +103,8 @@ static NSString *S3LoadedImages(void) {
 static __weak UIWindow *gAnnoWindow = nil;
 static __weak UIViewController *gVC = nil;
 static CGFloat gAnnoSavedLevel = 0;
-static BOOL gAnnoSaved = NO;
+static BOOL gLevelChanged = NO;      // 只有走过最后手段才为 YES
 static BOOL gKbSeen = NO;
-static NSMutableArray *gRaised = nil;
 static NSMutableArray *gObservers = nil;
 
 // ───────────────────────────── 工具 ─────────────────────────────
@@ -127,29 +116,13 @@ static NSArray *S3AllWindows(void) {
             if (![all containsObject:w]) [all addObject:w];
         }
     }
-    // iOS 16 起这条拿不到键盘窗口，但拿得到应用自己的窗口，做兜底
     id appw = [[UIApplication sharedApplication] valueForKey:@"windows"];
     if ([appw isKindOfClass:[NSArray class]]) {
         for (UIWindow *w in (NSArray *)appw) {
             if (![all containsObject:w]) [all addObject:w];
         }
     }
-    // 最可靠的一条：文字效果窗口（系统键盘真正所在）
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    Class tew = NSClassFromString(@"UITextEffectsWindow");
-    if (tew && [tew respondsToSelector:@selector(sharedTextEffectsWindow)]) {
-        id w = [(id)tew performSelector:@selector(sharedTextEffectsWindow)];
-        if (w && ![all containsObject:w]) [all addObject:w];
-    }
-#pragma clang diagnostic pop
     return all;
-}
-
-static BOOL S3IsKeyboardish(UIWindow *w) {
-    NSString *n = NSStringFromClass([w class]);
-    return [n containsString:@"TextEffects"] || [n containsString:@"Keyboard"] ||
-           [n containsString:@"InputWindow"];
 }
 
 static NSString *S3WindowDump(void) {
@@ -181,38 +154,22 @@ static UIView *S3FindEditable(UIView *v, int depth) {
     return nil;
 }
 
-// 压标注窗口层级 + 键盘类窗口兜底抬升（幂等）
-static void S3OrderWindows(UIWindow *anno, NSString *why) {
-    if (!anno) return;
+static UIResponder *S3InputIn(UIViewController *vc) {
+    UIView *v = [vc.view viewWithTag:200];
+    if ([v isKindOfClass:[UITextField class]] || [v isKindOfClass:[UITextView class]]) return (UIResponder *)v;
+    return (UIResponder *)S3FindEditable(vc.view, 0);
+}
 
-    if (!gAnnoSaved) {
-        gAnnoSaved = YES;
-        gAnnoSavedLevel = anno.windowLevel;
-        gAnnoWindow = anno;
-        S3Log(@"[%@] 记录标注窗口原层级 %.0f，压到 %.0f", why, gAnnoSavedLevel, kAnnoLowLevel);
-    }
-    if (anno.windowLevel != kAnnoLowLevel) {
-        CGFloat old = anno.windowLevel;
-        anno.windowLevel = kAnnoLowLevel;
-        S3Log(@"[%@] 标注窗口层级 %.0f -> %.0f", why, old, kAnnoLowLevel);
-    }
-
-    if (!gRaised) gRaised = [NSMutableArray array];
-    for (UIWindow *w in S3AllWindows()) {
-        if (w == anno || !S3IsKeyboardish(w)) continue;
-        if (w.windowLevel <= kAnnoLowLevel) {
-            CGFloat old = w.windowLevel;
-            [gRaised addObject:@[ [NSValue valueWithNonretainedObject:w], @(old) ]];
-            w.windowLevel = kKbMinLevel;
-            S3Log(@"[%@] 抬升 %@ 层级 %.0f -> %.0f",
-                  why, NSStringFromClass([w class]), old, kKbMinLevel);
-        }
-        if (w.isHidden) {
-            w.hidden = NO;
-            S3Log(@"[%@] 取消隐藏 %@", why, NSStringFromClass([w class]));
-        }
-    }
-    S3Log(@"[%@] 层级处理完毕，当前窗口：%@", why, S3WindowDump());
+// 只有「重试全打完、键盘还是没出现」时才调用一次
+static void S3FallbackLowerLevel(UIWindow *anno) {
+    if (!anno || gLevelChanged) return;
+    gAnnoSavedLevel = anno.windowLevel;
+    gAnnoWindow = anno;
+    anno.windowLevel = kAnnoFallbackLevel;
+    gLevelChanged = YES;
+    S3Log(@"最后手段：标注窗口层级 %.0f -> %.0f",
+          gAnnoSavedLevel, kAnnoFallbackLevel);
+    S3Log(@"当前窗口：%@", S3WindowDump());
 }
 
 static void S3Restore(void) {
@@ -224,7 +181,7 @@ static void S3Restore(void) {
             S3Log(@"还原：文字面板位置复位");
         }
     }
-    if (gAnnoSaved) {
+    if (gLevelChanged) {
         UIWindow *w = gAnnoWindow;
         if (w) {
             S3Log(@"还原：标注窗口层级 %.0f -> %.0f", w.windowLevel, gAnnoSavedLevel);
@@ -233,17 +190,7 @@ static void S3Restore(void) {
             S3Log(@"还原：标注窗口已不存在");
         }
     }
-    for (NSArray *pair in gRaised) {
-        UIWindow *w = [pair[0] nonretainedObjectValue];
-        CGFloat old = [pair[1] doubleValue];
-        if (w) {
-            S3Log(@"还原：%@ 层级 %.0f -> %.0f",
-                  NSStringFromClass([w class]), w.windowLevel, old);
-            w.windowLevel = old;
-        }
-    }
-    [gRaised removeAllObjects];
-    gAnnoSaved = NO;
+    gLevelChanged = NO;
     gAnnoSavedLevel = 0;
     gAnnoWindow = nil;
     gVC = nil;
@@ -267,22 +214,17 @@ static void S3Attempt(UIViewController *vc, int attempt) {
 
     if (!anno.isKeyWindow) {
         [anno makeKeyWindow];
-        S3Log(@"第 %d 次：标注窗口 makeKeyWindow", attempt);
+        S3Log(@"第 %d 次：标注窗口 makeKeyWindow（level=%.0f）", attempt, anno.windowLevel);
     }
 
-    NSString *why = [NSString stringWithFormat:@"第 %d 次", attempt];
-    S3OrderWindows(anno, why);
-
-    UITextField *tf = (UITextField *)[vc.view viewWithTag:200];
-    if (![tf isKindOfClass:[UITextField class]]) tf = (UITextField *)S3FindEditable(vc.view, 0);
-
+    UIResponder *tf = S3InputIn(vc);
     if (!tf) {
         S3Log(@"第 %d 次：面板里没找到输入框", attempt);
         return;
     }
 
     if (tf.isFirstResponder) {
-        S3Log(@"第 %d 次：输入框已是第一响应者（键盘是否出现过=%d）", attempt, (int)gKbSeen);
+        S3Log(@"第 %d 次：输入框已是第一响应者（键盘出现过=%d）", attempt, (int)gKbSeen);
     } else {
         BOOL ok = [tf becomeFirstResponder];
         S3Log(@"第 %d 次：becomeFirstResponder -> %d", attempt, (int)ok);
@@ -295,12 +237,20 @@ static void S3Attempt(UIViewController *vc, int attempt) {
         }
     }
 
-    // 键盘没出现就继续等；用通知回调置 gKbSeen，比猜时间可靠
+    // 键盘没出现就继续等；gKbSeen 由 UIKeyboardWill/DidShow 通知置位
     if (!gKbSeen && attempt < 8) {
         int64_t ns = (int64_t)(0.15 * (1 << (attempt > 4 ? 4 : attempt)) * NSEC_PER_SEC);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ns), dispatch_get_main_queue(), ^{
             S3Attempt(vc, attempt + 1);
         });
+        return;
+    }
+
+    // 重试打完还没见到键盘：才动用最后手段（改层级），然后再试几次
+    if (!gKbSeen && attempt == 8) {
+        S3FallbackLowerLevel(anno);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ S3Attempt(vc, 9); });
     }
 }
 
@@ -315,8 +265,8 @@ static void S3ShiftPanel(NSNotification *n, BOOL up) {
         NSValue *v = n.userInfo[UIKeyboardFrameEndUserInfoKey];
         if ([v isKindOfClass:[NSValue class]]) h = CGRectGetHeight([v CGRectValue]);
         if (h <= 0 || h > 600) h = 336.0;
+        if (!CGAffineTransformIsIdentity(panel.transform)) return;   // 已经抬过了
     }
-    if (up && CGAffineTransformIsIdentity(panel.transform) == NO) return;
     [UIView animateWithDuration:0.25 animations:^{
         panel.transform = up ? CGAffineTransformMakeTranslation(0, -h)
                              : CGAffineTransformIdentity;
@@ -342,9 +292,8 @@ static void S3InstallHook(void) {
     if (mEnsure) {
         IMP origEnsure = method_getImplementation(mEnsure);
         IMP newImp = imp_implementationWithBlock(^(UIViewController *self) {
-            // [3] 先压层级，再交给原实现去 becomeFirstResponder
             UIWindow *anno = S3WindowForView(self.view);
-            if (anno) S3OrderWindows(anno, @"调原实现前");
+            if (anno && !anno.isKeyWindow) [anno makeKeyWindow];
             if (origEnsure) ((void (*)(id, SEL))origEnsure)(self, selEnsure);
             gVC = self;
             dispatch_async(dispatch_get_main_queue(), ^{ S3Attempt(self, 0); });
@@ -362,7 +311,7 @@ static void S3InstallHook(void) {
             if (origDis) {
                 ((void (*)(id, SEL, BOOL))origDis)(self, @selector(viewDidDisappear:), animated);
             }
-            S3Log(@"viewDidDisappear -> 还原层级");
+            S3Log(@"viewDidDisappear -> 还原");
             S3Restore();
         });
         method_setImplementation(mDis, newDis);
@@ -388,7 +337,6 @@ __attribute__((constructor)) static void S3Init(void) {
                                           usingBlock:^(NSNotification *n) {
             gKbSeen = YES;
             S3Log(@"UIKeyboardWillShow 到了 frame=%@", n.userInfo[UIKeyboardFrameEndUserInfoKey]);
-            if (gAnnoWindow) S3OrderWindows(gAnnoWindow, @"键盘将显示");
             S3ShiftPanel(n, YES);
         }]];
         [gObservers addObject:[nc addObserverForName:UIKeyboardDidShowNotification
@@ -396,8 +344,7 @@ __attribute__((constructor)) static void S3Init(void) {
                                                queue:[NSOperationQueue mainQueue]
                                           usingBlock:^(NSNotification *n) {
             gKbSeen = YES;
-            S3Log(@"UIKeyboardDidShow 到了：键盘确认可见");
-            if (gAnnoWindow) S3OrderWindows(gAnnoWindow, @"键盘已显示");
+            S3Log(@"UIKeyboardDidShow 到了：键盘确认出现");
             S3ShiftPanel(n, YES);
         }]];
         [gObservers addObject:[nc addObserverForName:UIKeyboardDidHideNotification
@@ -408,12 +355,12 @@ __attribute__((constructor)) static void S3Init(void) {
             S3ShiftPanel(n, NO);
         }]];
 
-        // 兜底：VC 被直接 dealloc 时还原层级
+        // 兜底：VC 被直接 dealloc 时还原
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-            if (!gAnnoSaved) return;
+            if (!gVC && !gLevelChanged) return;
             UIViewController *vc = gVC;
             if (!vc || vc.isBeingDismissed || !vc.isViewLoaded || !vc.view.window) {
-                S3Log(@"清理：文字面板已消失，还原层级");
+                S3Log(@"清理：文字面板已消失");
                 S3Restore();
             }
         }];
