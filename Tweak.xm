@@ -1,39 +1,67 @@
-// S3TextKeyboardFix 1.6.9 —— 让「截图标记」的文字标注面板弹出系统原生键盘
+// S3TextKeyboardFix 1.7.0 —— 静默修复版
 //
 // ─────────────────────────────────────────────────────────────────────────
-// 一、这一版的核心变化：不再猜，把判定结果直接显示在屏幕上
+// 一、1.6.9 那张诊断截图把问题定死了
 //
-// 前几轮的教训：每次都是"改了理论 → 用户装 → 还是不行 → 再猜"。原因是**拿不到运行时数据**。
-// 所以 1.6.9 做了三件事：
-//   1) 在屏幕上打一块诊断横幅（15 秒后自动消失），用户截个图就能看到全部关键状态；
-//   2) 日志同时写两份，其中 /var/mobile/Media/ 是电脑上（爱思助手 / AFC）能直接取到的目录；
-//   3) 用一个「隐藏探针输入框」把问题一刀切成两半（见下）。
+// 截图上的七行数据：
+//     镜像=2份            本份=TweakInject/S3TextKeyboardFix.dylib
+//     标注窗口=UIWindow lv=1001 key=1
+//     输入框=UITextView tag=200 fr=1
+//     键盘通知=0          层级已压=0
+//     硬件键盘=0          探针=抢到焦点/键盘不出
 //
-// 二、问题的两种可能，用探针一次判定
+// 逐条读：
+//   1) 「键盘通知=0」是决定性的。如果键盘只是被标注窗口(lv=1001)盖住了，
+//      系统一样会发 UIKeyboardWillShow —— 我们收不到，说明**键盘压根没被叫起来**。
+//      所以「层级压住键盘」那条路可以直接判死，1.6.3 / 1.6.6 的做法本来就是错的。
+//   2) 「输入框 fr=1」= 真输入框已经是第一响应者了，biaoji 自己的
+//      ensureTextKeyboard（makeKeyWindow + becomeFirstResponder）没写错。
+//   3) 「探针=抢到焦点/键盘不出」= 我们往同一个窗口里塞了一个全新的、干净的
+//      UITextField，它抢到了焦点，键盘照样不出来 → **这个 UIWindow 本身托不住键盘**，
+//      跟 biaoji 的输入框、跟调用时序都无关。
+//   4) 「硬件键盘=0」= 不是「连了实体键盘所以系统不弹软键盘」那条分支。
 //
-//   「有光标但没键盘」只可能是两类原因：
-//     A. 系统压根没让键盘出现（第一响应者/窗口不是 key/硬件键盘模式/场景不活跃）
-//     B. 键盘其实出现了，只是被盖在标注窗口（level 1001）下面
+// 结论：标注窗口能显示、能当 key window、能拿到第一响应者，但整个窗口拿不到系统键盘。
+//       在 iOS 13+ 上这只有一个已知成因：**承载它的那个 UIWindowScene 不对**
+//       （场景没附着、或者附到了一个不承载键盘的场景）。窗口层级(1001)与此无关。
 //
-//   判定方法：在标注窗口里插一个几乎不可见的 UITextField，让它成为第一响应者。
-//     - 探针能弹键盘  → 该窗口能承载键盘 → 问题在原输入框或时序 → 属 A 的其他分支
-//     - 探针弹不出键盘 → 窗口层面就承载不了 → 属 A
-//   同时监听 UIKeyboardWillShow/DidShow：**系统一旦发出这两个通知，就说明键盘真的出现了，
-//   此时若用户仍看不到，则必然是 B（被盖住）**。
+//   注：biaoji 建窗口时是先 `[UIApplication sharedApplication].connectedScenes`
+//       里找一个 `activationState == 0`（ForegroundActive）的 UIWindowScene，
+//       找到才用 `initWithWindowScene:`，找不到就退化成 `initWithFrame:`
+//       —— 而 iOS 13+ 的**无场景窗口永远拿不到软键盘**（也不会旋转）。
+//       反汇编 biaoji.dylib 0x145d0~0x146bc 就是这段。
 //
-//   于是 1.6.9 的处置是有依据的、二选一：
-//     · 收到键盘通知（kb=1）→ 判定 B → 才去把标注窗口压到键盘之下（1.0）。
-//       1.6.3 的错在于**不分情况**先压层级，还把窗口压到 10（正好和键盘窗口同层，同层按创建
-//       顺序仍然压在上面），结果既没用又可能丢第一响应者。
-//     · 收不到键盘通知（kb=0）→ 判定 A → **一律不动窗口层级**，把状态原样报出来。
+// ─────────────────────────────────────────────────────────────────────────
+// 二、1.6.9 把你坑得更狠的地方（这一版全部删掉）
 //
-// 三、输入框的事实（反汇编 biaoji.dylib 确认）
-//   - 文字面板输入框是标准 UITextField，tag = 0xC8 = 200，没有自定义 inputView；
-//   - 面板容器 tag = 999，在屏幕底部，键盘弹出会盖住「取消 / 确认」→ 需要 transform 上移；
-//   - 标注窗口是标准 UIWindow（_OBJC_CLASS_$_UIWindow），windowLevel = _UIWindowLevelStatusBar + 1 = 1001，
-//     创建时即 setHidden:NO + makeKeyWindow；resignKeyWindow 只在 closeAnimated / airDropTapped 里调用；
-//   - biaoji 自己的 -ensureTextKeyboard（IMP 0xba70）是**标准且正确**的：先 makeKeyWindow，
-//     再 dispatch_async 里 becomeFirstResponder；只是没有重试。
+//   · 11 级重试阶梯、跨 7 秒，每一步都在 makeKeyWindow + becomeFirstResponder。
+//     你点「取消」的瞬间，阶梯刚好把焦点抢回来 → 面板关不掉。这是我自己造的 bug。
+//   · 诊断横幅另外开了一个 lv=1005 的全屏 UIWindow —— 又多一层窗口去掺和场景和
+//     键盘判定，纯属自找麻烦。
+//   · 探针（往窗口里插隐藏输入框、抢焦点、再还回去）—— 目的已经达到，删。
+//
+//   1.7.0 的横幅改成**贴在标注窗口上的一块 UILabel**（userInteractionEnabled=NO），
+//   不新建窗口、不吃触摸，15 秒自动消失；重试缩到 4 步、2 秒内结束、只抢不回退。
+//
+// ─────────────────────────────────────────────────────────────────────────
+// 三、1.7.0 实际做的四件事（按顺序，每一步都记日志）
+//
+//   第 0 步：体检 + 补场景。如果标注窗口的 windowScene 是空的，就把它挂到一个
+//           「真正承载键盘」的场景上（优先：当前 key window 所在的场景 > 有
+//           lv>=1000 状态栏窗口的场景 > 第一个 ForegroundActive 场景）。
+//           这一步是唯一有可能**真正修好**的动作，且只在场景缺失时动手。
+//   第 1 步：找键盘窗口（UITextEffectsWindow / UIRemoteKeyboardWindow / UIKeyboardWindow）。
+//           找到 → 说明键盘真的起来了、只是被 lv=1001 的标注窗口压住，
+//           此时把标注窗口降到「比键盘窗口低 0.5」——而不是瞎降到 10。
+//   第 2 步：再没有 → 抬键盘窗口到标注窗口之上（双保险，两条路各试一次）。
+//   第 3 步：还不行 → 给输入框挂一个 1pt 透明、不吃触摸的 inputAccessoryView
+//           再 reloadInputViews。依据：1.6.2 那版挂了自定义键盘视图时，
+//           原生键盘是跟着一起出来的 —— 挂上输入视图会让系统走一遍输入视图的
+//           呈现流程，这是唯一一条「你亲口验证过键盘出现过」的线索。
+//   第 4 步：2 秒后仍无键盘 → **所有改动全部回滚**（层级复位），屏幕上留一份
+//           判定，日志写两份文件。
+//
+//   全程绝不 resignFirstResponder、绝不调用 sbreload/killall。
 // ─────────────────────────────────────────────────────────────────────────
 
 #import <UIKit/UIKit.h>
@@ -46,11 +74,9 @@
 
 static NSString *const kLogPathDocuments = @"/var/mobile/Documents/S3TextKeyboardFix.log";
 static NSString *const kLogPathMedia     = @"/var/mobile/Media/S3TextKeyboardFix.log";
+static NSString *const kS3Ver = @"1.7.0";
 
-static NSString *const kS3Ver = @"1.6.9";
-
-// 判定为 B（键盘被盖住）之后，把标注窗口压到这个层级（严格低于键盘窗口）
-static const CGFloat kAnnoLevelUnderKeyboard = 1.0;
+static const CGFloat kMinSaneLevel = 1.0;   // 标注窗口最多降到这个层级，保证还在桌面图标之上
 
 // ───────────────────────────── 日志（双份） ─────────────────────────────
 static void S3Append(NSString *path, NSString *line) {
@@ -71,12 +97,12 @@ static void S3Log(NSString *fmt, ...) {
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[S3TextFix %@] %@\n", kS3Ver, s];
+    NSString *line = [NSString stringWithFormat:@"[S3Fix %@] %@\n", kS3Ver, s];
     S3Append(kLogPathDocuments, line);
     S3Append(kLogPathMedia, line);
 }
 
-// ───────────────────── 自证身份：本 dylib 到底是谁 ─────────────────────
+// ───────────────────── 自证身份：进程里都有谁 ─────────────────────
 static NSString *S3SelfPath(void) {
     Dl_info info;
     const char *p = "?";
@@ -84,95 +110,97 @@ static NSString *S3SelfPath(void) {
     return [NSString stringWithUTF8String:p];
 }
 
-// 短路径：只留最后两段，横幅上用
 static NSString *S3SelfShort(void) {
     NSArray *c = [S3SelfPath() componentsSeparatedByString:@"/"];
     if (c.count >= 2) return [NSString stringWithFormat:@"%@/%@", c[c.count - 2], c.lastObject];
     return S3SelfPath();
 }
 
-static NSArray<NSString *> *S3RelatedImages(void) {
-    NSMutableArray *a = [NSMutableArray array];
+// 分开统计：补丁自己几份（>1 就是重复注入）+ biaoji 主体几份
+static void S3ImageStats(int *fixCount, int *hostCount) {
+    int fix = 0, host = 0;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *nm = _dyld_get_image_name(i);
         if (!nm) continue;
         NSString *f = [NSString stringWithUTF8String:nm];
         if (!f) continue;
-        if ([f containsString:@"S3TextKeyboardFix"] || [f containsString:@"biaoji"]) [a addObject:f];
+        if ([f containsString:@"S3TextKeyboardFix.dylib"]) fix++;
+        else if ([f containsString:@"biaoji.dylib"]) host++;
     }
-    return a;
+    if (fixCount) *fixCount = fix;
+    if (hostCount) *hostCount = host;
 }
 
 // ───────────────────────────── 状态 ─────────────────────────────
-static __weak UIWindow *gAnnoWindow = nil;
+static __weak UIWindow *gAnnoWin = nil;
 static __weak UIViewController *gVC = nil;
-static BOOL gKbSeen = NO;              // 系统是否已发出键盘显示通知（判定 A/B 的关键）
-static BOOL gKbFrameLogged = NO;
-static BOOL gLevelLowered = NO;
+static BOOL gKbSeen = NO;
+static int gGen = 0;
+static double gStartAt = 0;
+static int gHookState = 0;
+
+static BOOL gAnnoLowered = NO;
 static CGFloat gAnnoSavedLevel = 0;
-static NSMutableArray *gObservers = nil;
-static int gGen = 0;                   // 每次打开面板递增，用来作废旧的重试链
-static int gHookState = 0;             // 0 未装 1 已装
-static NSInteger gProbeResult = 0;     // 0 未测 1 窗口能弹键盘 2 抢到焦点但无键盘 3 连焦点都抢不到
 
-// ───────────────────────────── 横幅 ─────────────────────────────
-@interface S3BannerWindow : UIWindow @end
-@implementation S3BannerWindow
-- (BOOL)canBecomeKeyWindow { return NO; }   // 绝不参与 key window 竞争，避免干扰键盘
-@end
+static __weak UIWindow *gKbWinRaised = nil;
+static CGFloat gKbSavedLevel = 0;
 
-static S3BannerWindow *gBannerWin = nil;
-static UILabel *gBannerLabel = nil;
-static NSTimer *gBannerHide = nil;
+static NSString *gSceneVerdict = @"未检查";
+static NSString *gTryDesc = @"无";
 
-static UIWindowScene *S3AnyWindowScene(void) {
-    if (gAnnoWindow.windowScene) return gAnnoWindow.windowScene;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)s;
-    }
-    return nil;
-}
+static UILabel *gTip = nil;
+static __weak UIWindow *gTipWin = nil;
+static NSTimer *gTipHide = nil;
 
-static void S3Banner(NSString *text) {
+// ───────────────────────── 屏幕提示（贴在标注窗口里，不吃触摸） ─────────────────────────
+static void S3Tip(UIWindow *anno, NSString *text, double hideAfter) {
+    if (!anno) return;
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ S3Banner(text); });
+        dispatch_async(dispatch_get_main_queue(), ^{ S3Tip(anno, text, hideAfter); });
         return;
     }
-    if (!gBannerWin) {
-        UIWindowScene *sc = S3AnyWindowScene();
-        CGRect b = sc ? sc.coordinateSpace.bounds : [UIScreen mainScreen].bounds;
-        gBannerWin = sc ? [[S3BannerWindow alloc] initWithWindowScene:sc]
-                        : [[S3BannerWindow alloc] initWithFrame:b];
-        gBannerWin.frame = b;
-        gBannerWin.windowLevel = 1005.0;      // 在标注窗口(1001)之上，远低于键盘窗口
-        gBannerWin.backgroundColor = [UIColor clearColor];
-        gBannerWin.rootViewController = [UIViewController new];
-        gBannerWin.rootViewController.view.backgroundColor = [UIColor clearColor];
-        gBannerWin.rootViewController.view.userInteractionEnabled = NO;
-        gBannerLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 60, b.size.width - 20, 10)];
-        gBannerLabel.numberOfLines = 0;
-        gBannerLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-        gBannerLabel.textColor = [UIColor whiteColor];
-        gBannerLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
-        gBannerLabel.layer.cornerRadius = 6;
-        gBannerLabel.clipsToBounds = YES;
-        [gBannerWin.rootViewController.view addSubview:gBannerLabel];
-        gBannerWin.hidden = NO;
+    if (gTip && gTipWin == anno && gTip.superview == anno) {
+        // 复用
+    } else {
+        gTip = nil;
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 56, anno.bounds.size.width - 20, 10)];
+        l.numberOfLines = 0;
+        l.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        l.textColor = [UIColor whiteColor];
+        l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.82];
+        l.layer.cornerRadius = 6;
+        l.clipsToBounds = YES;
+        l.userInteractionEnabled = NO;      // 关键：不吃触摸，面板照常能点
+        l.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [anno addSubview:l];
+        gTip = l;
+        gTipWin = anno;
     }
-    if (!gBannerLabel) return;
-    gBannerLabel.text = [NSString stringWithFormat:@"\n%@\n", text];   // 上下留白
-    CGFloat w = gBannerWin.frame.size.width - 20;
-    CGSize sz = [gBannerLabel sizeThatFits:CGSizeMake(w, 900)];
-    gBannerLabel.frame = CGRectMake(10, 60, w, sz.height + 4);
-    gBannerLabel.hidden = NO;
-    [gBannerHide invalidate];
-    gBannerHide = [NSTimer scheduledTimerWithTimeInterval:15 repeats:NO block:^(NSTimer *t) {
-        gBannerLabel.hidden = YES;
-    }];
+    [anno bringSubviewToFront:gTip];
+    gTip.hidden = NO;
+    gTip.text = [NSString stringWithFormat:@"\n%@\n", text];
+    CGFloat w = anno.bounds.size.width - 20;
+    CGSize sz = [gTip sizeThatFits:CGSizeMake(w, 900)];
+    gTip.frame = CGRectMake(10, 56, w, sz.height + 2);
+
+    [gTipHide invalidate];
+    if (hideAfter > 0) {
+        gTipHide = [NSTimer scheduledTimerWithTimeInterval:hideAfter repeats:NO block:^(NSTimer *t) {
+            gTip.hidden = YES;
+        }];
+    }
+}
+
+static void S3TipHideNow(void) {
+    [gTipHide invalidate];
+    gTipHide = nil;
+    if (gTip) gTip.hidden = YES;
 }
 
 // ───────────────────────────── 工具 ─────────────────────────────
+static void S3CollectWindowsIn(UIView *v, NSMutableArray *out, int depth);
+
 static NSArray<UIWindow *> *S3AllWindows(void) {
     NSMutableArray *all = [NSMutableArray array];
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -187,16 +215,66 @@ static NSArray<UIWindow *> *S3AllWindows(void) {
             if (![all containsObject:w]) [all addObject:w];
         }
     }
+    // 键盘窗口在 iOS 15+ 可能不在 UIApplication.windows 里，从各窗口的视图树里再捞一遍
+    for (UIWindow *w in [all copy]) {
+        [S3CollectWindowsIn:w into:all depth:0];
+    }
     return all;
 }
 
-static NSString *S3WindowDump(void) {
-    NSMutableString *s = [NSMutableString string];
-    for (UIWindow *w in S3AllWindows()) {
-        [s appendFormat:@"\n      %@ level=%.0f hidden=%d key=%d",
-         NSStringFromClass([w class]), w.windowLevel, (int)w.isHidden, (int)w.isKeyWindow];
+static void S3CollectWindowsIn(UIView *v, NSMutableArray *out, int depth) {
+    if (!v || depth > 5) return;
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UIWindow class]] && ![out containsObject:(UIWindow *)sub]) {
+            [out addObject:(UIWindow *)sub];
+        }
+        S3CollectWindowsIn(sub, out, depth + 1);
     }
-    return s;
+}
+
+static BOOL S3IsKeyboardWindow(UIWindow *w) {
+    if (!w) return NO;
+    NSString *n = NSStringFromClass([w class]);
+    if ([n rangeOfString:@"TextEffects"].location != NSNotFound) return YES;
+    if ([n rangeOfString:@"RemoteKeyboard"].location != NSNotFound) return YES;
+    if ([n rangeOfString:@"KeyboardWindow"].location != NSNotFound) return YES;
+    if ([n rangeOfString:@"UIKeyboard"].location != NSNotFound) return YES;
+    return NO;
+}
+
+// 找键盘窗口：含 [UIApplication sharedTextEffectsWindow] 这条私有入口
+static UIWindow *S3FindKeyboardWindow(NSString **dump) {
+    NSMutableString *ms = [NSMutableString string];
+    UIWindow *best = nil;
+    NSMutableArray *cands = [NSMutableArray array];
+    for (UIWindow *w in S3AllWindows()) {
+        if (S3IsKeyboardWindow(w)) [cands addObject:w];
+    }
+    UIApplication *app = [UIApplication sharedApplication];
+    SEL sel  = NSSelectorFromString(@"sharedTextEffectsWindow");
+    SEL sel2 = NSSelectorFromString(@"sharedTextEffectsWindowForWindowScene:");
+    if ([app respondsToSelector:sel]) {
+        IMP imp = [app methodForSelector:sel];
+        id r = ((id (*)(id, SEL))imp)(app, sel);
+        if ([r isKindOfClass:[UIWindow class]] && ![cands containsObject:r]) [cands addObject:r];
+    }
+    if ([app respondsToSelector:sel2] && gAnnoWin.windowScene) {
+        IMP imp = [app methodForSelector:sel2];
+        id r = ((id (*)(id, SEL, id))imp)(app, sel2, gAnnoWin.windowScene);
+        if ([r isKindOfClass:[UIWindow class]] && ![cands containsObject:r]) [cands addObject:r];
+    }
+    if (cands.count == 0) {
+        [ms appendString:@"键盘窗口=未找到"];
+    } else {
+        for (UIWindow *w in cands) {
+            [ms appendFormat:@"键盘窗口=%@ lv=%.0f hidden=%d %.0fx%.0f  ",
+             NSStringFromClass([w class]), w.windowLevel, (int)w.isHidden,
+             w.frame.size.width, w.frame.size.height];
+            if (!best || w.windowLevel > best.windowLevel) best = w;
+        }
+    }
+    if (dump) *dump = ms;
+    return best;
 }
 
 static UIWindow *S3WindowForView(UIView *v) {
@@ -220,6 +298,7 @@ static UIView *S3FindEditable(UIView *v, int depth) {
 }
 
 static UIResponder *S3InputIn(UIViewController *vc) {
+    if (!vc || !vc.isViewLoaded) return nil;
     UIView *v = [vc.view viewWithTag:200];
     if ([v isKindOfClass:[UITextField class]] || [v isKindOfClass:[UITextView class]]) return (UIResponder *)v;
     return (UIResponder *)S3FindEditable(vc.view, 0);
@@ -227,11 +306,19 @@ static UIResponder *S3InputIn(UIViewController *vc) {
 
 static NSString *S3DescribeInput(UIResponder *r) {
     if (!r) return @"无";
-    NSString *tag = [r isKindOfClass:[UIView class]] ? [NSString stringWithFormat:@" tag=%ld", (long)((UIView *)r).tag] : @"";
-    return [NSString stringWithFormat:@"%@%@ fr=%d", NSStringFromClass([r class]), tag, (int)r.isFirstResponder];
+    if (![r isKindOfClass:[UIView class]]) return NSStringFromClass([r class]);
+    UIView *v = (UIView *)r;
+    NSMutableString *s = [NSMutableString stringWithFormat:@"%@ tag=%ld fr=%d",
+                          NSStringFromClass([v class]), (long)v.tag, (int)r.isFirstResponder];
+    if ([v isKindOfClass:[UITextView class]]) {
+        UITextView *tv = (UITextView *)v;
+        [s appendFormat:@" editable=%d 交互=%d", (int)tv.isEditable, (int)tv.isUserInteractionEnabled];
+    } else if ([v isKindOfClass:[UITextField class]]) {
+        [s appendFormat:@" 交互=%d", (int)v.isUserInteractionEnabled];
+    }
+    return s;
 }
 
-// 硬件键盘模式：开着的话系统**永远不会**弹屏幕键盘，表现就是「有光标没键盘」
 static NSInteger S3HardwareKeyboardMode(void) {
     Class k = NSClassFromString(@"UIKeyboard");
     SEL s = NSSelectorFromString(@"isInHardwareKeyboardMode");
@@ -240,224 +327,255 @@ static NSInteger S3HardwareKeyboardMode(void) {
     return fn(k, s) ? 1 : 0;
 }
 
-static NSString *S3StatusLine(UIViewController *vc) {
-    UIWindow *anno = S3WindowForView(vc.view);
-    NSArray<NSString *> *imgs = S3RelatedImages();
-    NSInteger hw = S3HardwareKeyboardMode();
-    return [NSString stringWithFormat:
-            @"S3TextFix %@  hook=%d  镜像=%lu份\n"
-            @"本份=%@\n"
-            @"标注窗口=%@ lv=%.0f key=%d\n"
-            @"输入框=%@\n"
-            @"键盘通知=%d  层级已压=%d\n"
-            @"硬件键盘=%ld  探针=%@",
-            kS3Ver, gHookState, (unsigned long)imgs.count,
-            S3SelfShort(),
-            anno ? NSStringFromClass([anno class]) : @"未找到",
-            anno ? anno.windowLevel : 0,
-            anno ? (int)anno.isKeyWindow : 0,
-            S3DescribeInput(S3InputIn(vc)),
-            (int)gKbSeen, (int)gLevelLowered,
-            (long)hw,
-            gProbeResult == 0 ? @"未测" : (gProbeResult == 1 ? @"能弹键盘" :
-                              (gProbeResult == 2 ? @"抢到焦点/键盘不出" : @"连焦点都抢不到"))];
-}
-
-// ───────────────── 判定 B 的处置：把标注窗口压到键盘之下 ─────────────────
-static void S3LowerIfCovering(void) {
-    if (gLevelLowered) return;
-    UIWindow *anno = gAnnoWindow;
-    if (!anno) return;
-    if (anno.windowLevel <= kAnnoLevelUnderKeyboard) return;
-    gAnnoSavedLevel = anno.windowLevel;
-    anno.windowLevel = kAnnoLevelUnderKeyboard;
-    gLevelLowered = YES;
-    S3Log(@"判定 B（键盘其实已弹出）→ 标注窗口层级 %.0f -> %.0f，让键盘不再被压住",
-          gAnnoSavedLevel, kAnnoLevelUnderKeyboard);
-    S3Log(@"当前窗口：%@", S3WindowDump());
-}
-
-static void S3Restore(void) {
-    if (gVC) {
-        UIView *panel = [gVC.view viewWithTag:999];
-        if (panel && !CGAffineTransformIsIdentity(panel.transform)) {
-            panel.transform = CGAffineTransformIdentity;
-            S3Log(@"还原：文字面板位置复位");
+// ───────────────────────── 场景体检 ─────────────────────────
+static NSString *S3ScenesReport(void) {
+    NSMutableString *s = [NSMutableString string];
+    UIApplication *app = [UIApplication sharedApplication];
+    [s appendFormat:@"  应用状态=%ld（0=Active 1=Inactive 2=Background） 硬件键盘=%ld\n",
+     (long)app.applicationState, (long)S3HardwareKeyboardMode()];
+    int i = 0;
+    for (UIScene *sc in app.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) {
+            [s appendFormat:@"  #%d %@（非窗口场景）act=%ld\n",
+             i++, NSStringFromClass([sc class]), (long)sc.activationState];
+            continue;
+        }
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        NSString *role = @"?";
+        @try { role = ws.session.role ?: @"nil"; } @catch (__unused NSException *e) {}
+        [s appendFormat:@"  #%d UIWindowScene act=%ld（0=前台活跃）role=%@ 窗口=%lu\n",
+         i++, (long)ws.activationState, role, (unsigned long)ws.windows.count];
+        for (UIWindow *w in ws.windows) {
+            [s appendFormat:@"       %@ lv=%.0f hidden=%d key=%d\n",
+             NSStringFromClass([w class]), w.windowLevel, (int)w.isHidden, (int)w.isKeyWindow];
         }
     }
-    if (gLevelLowered) {
-        UIWindow *w = gAnnoWindow;
+    return s;
+}
+
+// 挑一个「真的能承载键盘」的场景
+static UIWindowScene *S3BestScene(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindowScene *fore = nil, *withBar = nil, *any = nil;
+    for (UIScene *sc in app.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        if (!any) any = ws;
+        if (ws.activationState == UISceneActivationStateForegroundActive) {
+            if (!fore) fore = ws;
+            for (UIWindow *w in ws.windows) {
+                if (w != gAnnoWin && w.isKeyWindow) return ws;              // 最优先：有别人在当 key
+                if (!withBar && w.windowLevel >= 1000 && !w.isHidden) withBar = ws;  // 其次：有状态栏窗口
+            }
+        }
+    }
+    if (withBar) return withBar;
+    if (fore) return fore;
+    return any;
+}
+
+// 第 0 步：补场景。只在确实缺失时动手，别去瞎折腾已经正常的窗口。
+static NSString *S3RepairScene(UIWindow *anno) {
+    if (!anno) return @"窗口=未找到";
+    UIWindowScene *cur = anno.windowScene;
+    if (cur) {
+        return [NSString stringWithFormat:@"窗口场景=%@ act=%ld（已有，不动）",
+                NSStringFromClass([cur class]), (long)cur.activationState];
+    }
+    UIWindowScene *best = S3BestScene();
+    if (!best) return @"窗口场景=无（找不到任何可用场景！）";
+    anno.windowScene = best;
+    BOOL ok = (anno.windowScene == best);
+    S3Log(@"★ 标注窗口原本没有 windowScene，已挂到 act=%ld 的场景 -> %d", (long)best.activationState, (int)ok);
+    return [NSString stringWithFormat:@"窗口场景=原来没有 → 已补挂 act=%ld -> %d",
+            (long)best.activationState, (int)ok];
+}
+
+// ───────────────────────── 层级处置 ─────────────────────────
+static void S3LowerAnnoUnderKeyboard(UIWindow *anno, UIWindow *kb) {
+    if (gAnnoLowered || !anno || !kb) return;
+    CGFloat target = kb.windowLevel - 0.5;
+    if (target < kMinSaneLevel) target = kMinSaneLevel;
+    if (anno.windowLevel <= target) return;
+    gAnnoSavedLevel = anno.windowLevel;
+    anno.windowLevel = target;
+    gAnnoLowered = YES;
+    S3Log(@"第1步：标注窗口 lv %.0f -> %.0f（键盘窗口 lv=%.0f，压到它下面 0.5）",
+          gAnnoSavedLevel, target, kb.windowLevel);
+}
+
+static void S3RaiseKeyboardWindow(UIWindow *anno, UIWindow *kb) {
+    if (gKbWinRaised || !anno || !kb) return;
+    if (kb.windowLevel > anno.windowLevel) return;      // 已经在上面了
+    gKbSavedLevel = kb.windowLevel;
+    kb.windowLevel = anno.windowLevel + 1.0;
+    gKbWinRaised = kb;
+    S3Log(@"第2步：抬键盘窗口 %@ lv %.0f -> %.0f（标注窗口 lv=%.0f）",
+          NSStringFromClass([kb class]), gKbSavedLevel, kb.windowLevel, anno.windowLevel);
+}
+
+static BOOL gAccessoryAdded = NO;
+
+@protocol S3InputViewHost <NSObject>
+@property (nullable, nonatomic, strong) UIView *inputAccessoryView;
+@end
+
+static void S3AttachAccessory(UIResponder *r) {
+    if (gAccessoryAdded || !r) return;
+    if (![r respondsToSelector:@selector(setInputAccessoryView:)]) return;
+    id<S3InputViewHost> h = (id<S3InputViewHost>)r;
+    UIView *old = [r respondsToSelector:@selector(inputAccessoryView)] ? h.inputAccessoryView : nil;
+    if (old) { gAccessoryAdded = YES; return; }
+    UIView *a = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 1)];
+    a.backgroundColor = [UIColor clearColor];
+    a.userInteractionEnabled = NO;
+    h.inputAccessoryView = a;
+    [r reloadInputViews];
+    gAccessoryAdded = YES;
+    S3Log(@"第3步：给输入框挂了一个 1pt 透明 inputAccessoryView 并 reloadInputViews");
+}
+
+// 只回滚层级，不碰 gVC —— 判定那张图还要留在屏幕上
+static void S3RollbackLevels(void) {
+    if (gAnnoLowered) {
+        UIWindow *w = gAnnoWin;
         if (w) {
-            S3Log(@"还原：标注窗口层级 %.0f -> %.0f", w.windowLevel, gAnnoSavedLevel);
+            S3Log(@"回滚：标注窗口 lv %.0f -> %.0f", w.windowLevel, gAnnoSavedLevel);
             w.windowLevel = gAnnoSavedLevel;
         }
     }
-    gLevelLowered = NO;
+    if (gKbWinRaised) {
+        S3Log(@"回滚：键盘窗口 lv %.0f -> %.0f", gKbWinRaised.windowLevel, gKbSavedLevel);
+        gKbWinRaised.windowLevel = gKbSavedLevel;
+    }
+    gAnnoLowered = NO;
     gAnnoSavedLevel = 0;
-    gAnnoWindow = nil;
-    gVC = nil;
+    gKbWinRaised = nil;
+    gKbSavedLevel = 0;
+    gAccessoryAdded = NO;
+}
+
+static void S3Restore(void) {
+    S3RollbackLevels();
     gKbSeen = NO;
-    gKbFrameLogged = NO;
-    gProbeResult = 0;
-    gGen++;                       // 作废旧的重试链
+    gVC = nil;
+    gGen++;
 }
 
-// 面板在屏幕底部，「取消/确认」就在最下面 —— 键盘弹出来正好盖住它俩。
-// 只对面板做 transform，不动 biaoji 自己的布局。
-static void S3ShiftPanel(NSNotification *n, BOOL up) {
-    if (!gVC) return;
-    UIView *panel = [gVC.view viewWithTag:999];
-    if (!panel) return;
-    CGFloat h = 0;
-    if (up) {
-        NSValue *v = n.userInfo[UIKeyboardFrameEndUserInfoKey];
-        if ([v isKindOfClass:[NSValue class]]) h = CGRectGetHeight([v CGRectValue]);
-        if (h <= 0 || h > 600) h = 336.0;
-        if (!CGAffineTransformIsIdentity(panel.transform)) return;
-    }
-    [UIView animateWithDuration:0.25 animations:^{
-        panel.transform = up ? CGAffineTransformMakeTranslation(0, -h)
-                             : CGAffineTransformIdentity;
-    }];
-    S3Log(@"文字面板%@ %.0f", up ? @"随键盘上移" : @"复位", h);
-}
-
-// ───────────────────────── 隐藏探针 ─────────────────────────
-static UITextField *gProbe = nil;
-
-static void S3ProbeBegin(UIViewController *vc) {
+// ───────────────────────── 屏幕上的那份判定 ─────────────────────────
+static NSString *S3StatusLine(UIViewController *vc, NSString *verdict) {
     UIWindow *anno = S3WindowForView(vc.view);
-    if (!anno) {
-        S3Log(@"探针：找不到标注窗口，跳过");
-        gProbeResult = 3;
-        return;
-    }
-    if (!gProbe) {
-        UITextField *f = [[UITextField alloc] initWithFrame:CGRectMake(1, 1, 2, 2)];
-        f.backgroundColor = [UIColor clearColor];
-        f.textColor = [UIColor clearColor];
-        f.tintColor = [UIColor clearColor];
-        f.opaque = NO;
-        gProbe = f;
-    }
-    [anno addSubview:gProbe];
-    BOOL ok = [gProbe becomeFirstResponder];
-    S3Log(@"探针：在标注窗口插入隐藏输入框并抢焦点 -> %d（窗口 key=%d）", (int)ok, (int)anno.isKeyWindow);
+    if (!anno) anno = gAnnoWin;
+    int fix = 0, host = 0;
+    S3ImageStats(&fix, &host);
+    UIResponder *input = S3InputIn(vc);
+    NSString *kbDump = nil;
+    UIWindow *kb = S3FindKeyboardWindow(&kbDump);
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"S3Fix %@ hook=%d 补丁镜像=%d份%@\n", kS3Ver, gHookState, fix,
+     fix > 1 ? @" ⚠️重复注入" : @""];
+    [s appendFormat:@"%@\n", S3SelfShort()];
+    [s appendFormat:@"窗口=%@ lv=%.0f key=%d\n",
+     anno ? NSStringFromClass([anno class]) : @"无", anno ? anno.windowLevel : 0,
+     anno ? (int)anno.isKeyWindow : 0];
+    [s appendFormat:@"输入框=%@\n", S3DescribeInput(input)];
+    [s appendFormat:@"键盘通知=%d %@\n", (int)gKbSeen, kbDump ?: @"");
+    [s appendFormat:@"硬件键盘=%ld\n", (long)S3HardwareKeyboardMode()];
+    [s appendFormat:@"场景: %@\n", gSceneVerdict];
+    [s appendFormat:@"已试: %@\n", gTryDesc];
+    [s appendFormat:@"%@\n", verdict];
+    [s appendString:@"日志 /var/mobile/Media/S3TextKeyboardFix.log"];
+    return s;
 }
 
-static void S3ProbeJudge(UIViewController *vc) {
-    if (gProbe) {
-        BOOL became = gProbe.isFirstResponder;
-        BOOL kb = gKbSeen;
-        gProbeResult = kb ? 1 : (became ? 2 : 3);
-        S3Log(@"探针结果：焦点=%d 键盘=%d → %@", (int)became, (int)kb,
-              kb ? @"该窗口能承载键盘（问题在原输入框/时序）"
-                 : (became ? @"抢到焦点但键盘不出（窗口或场景层面被拦）"
-                           : @"连焦点都抢不到（另有第一响应者或场景不活跃）"));
-        [gProbe resignFirstResponder];
-        [gProbe removeFromSuperview];
-        gProbe = nil;
-    }
-    UIResponder *tf = S3InputIn(vc);
-    if (tf) [tf becomeFirstResponder];     // 把焦点还给真正的输入框
-}
-
-// ───────────────────── 核心：一次尝试 ─────────────────────
-static void S3Attempt(UIViewController *vc, int attempt) {
-    if (!vc) return;
-
-    UIWindow *anno = S3WindowForView(vc.view);
-    if (!anno) {
-        S3Log(@"第 %d 次：还找不到 vc 所在窗口 %@", attempt, vc);
-        return;
-    }
-    gAnnoWindow = anno;
-
-    if (!anno.isKeyWindow) {
-        [anno makeKeyWindow];
-        S3Log(@"第 %d 次：标注窗口 makeKeyWindow → key=%d", attempt, (int)anno.isKeyWindow);
-    }
-
-    UIResponder *tf = S3InputIn(vc);
-    if (!tf) {
-        S3Log(@"第 %d 次：面板里没找到输入框", attempt);
-        return;
-    }
-
-    if (tf.isFirstResponder) {
-        S3Log(@"第 %d 次：输入框已是第一响应者（键盘=%d）", attempt, (int)gKbSeen);
-    } else {
-        BOOL ok = [tf becomeFirstResponder];
-        S3Log(@"第 %d 次：becomeFirstResponder -> %d", attempt, (int)ok);
-        if (!ok) {
-            [tf resignFirstResponder];
-            [tf reloadInputViews];
-            ok = [tf becomeFirstResponder];
-            S3Log(@"第 %d 次：resign/reload 后重试 -> %d", attempt, (int)ok);
-        }
-    }
-}
-
-// 固定节奏的重试阶梯（秒），到点执行对应动作，键盘一出现就立刻收工
-static const double kStepGap[] = {0, 0.15, 0.25, 0.35, 0.5, 0.6, 0.8, 0.8, 1.0, 1.5, 1.5};
-#define kNumSteps ((int)(sizeof(kStepGap) / sizeof(kStepGap[0])))
-
+// ───────────────────────── 分步执行 ─────────────────────────
 static void S3Step(UIViewController *vc, int step, int gen);
 
-static void S3Schedule(UIViewController *vc, int step, int gen) {
-    double gap = (step + 1 < kNumSteps) ? kStepGap[step + 1] : 0;
+static void S3Schedule(UIViewController *vc, int step, int gen, double gap) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ S3Step(vc, step + 1, gen); });
 }
 
 static void S3Step(UIViewController *vc, int step, int gen) {
     if (gen != gGen || !vc) return;
+    UIWindow *anno = S3WindowForView(vc.view);
+    if (!anno) anno = gAnnoWin;
+    UIResponder *input = S3InputIn(vc);
 
-    // 键盘出现 → 收工。系统都发了通知还看不到键盘，那就是被标注窗口压住了（判定 B）
-    if (gKbSeen && step > 0) {
-        S3LowerIfCovering();
-        S3Log(@"键盘已确认出现（第 %d 步）", step);
-        S3Banner([NSString stringWithFormat:@"%@\n\n✔ 键盘已弹出（系统已确认）", S3StatusLine(vc)]);
-        return;
-    }
-
-    if (step >= kNumSteps) {
-        S3Log(@"阶梯走完：键盘始终没出现（来自 %@）", S3SelfShort());
-        S3Log(@"最终窗口：%@", S3WindowDump());
-        NSString *verdict = [NSString stringWithFormat:
-            @"%@\n\n✘ 键盘没弹出\n判定=%@\n→ 请把这块截图发给作者",
-            S3StatusLine(vc),
-            gProbeResult == 1 ? @"窗口正常，原输入框/时序问题"
-                              : (gProbeResult == 2 ? @"窗口抢到焦点但键盘不出"
-                                                   : (gProbeResult == 3 ? @"连焦点都抢不到"
-                                                                        : @"未知（探针没跑到）"))];
-        S3Banner(verdict);
+    // 键盘一出现就收工，不再动任何东西
+    if (gKbSeen) {
+        S3Log(@"✔ 键盘已确认出现（第 %d 步收工）", step);
+        S3Tip(anno, S3StatusLine(vc, @"✔ 键盘已弹出（系统已确认）"), 3.0);
         return;
     }
 
     switch (step) {
         case 0: {
-            gAnnoWindow = S3WindowForView(vc.view);
-            S3Log(@"──── 开始尝试（来自 %@）", S3SelfShort());
-            S3Log(@"硬件键盘模式=%ld（1 = 系统永远不会弹屏幕键盘）", (long)S3HardwareKeyboardMode());
-            S3Log(@"窗口清单：%@", S3WindowDump());
-            S3Log(@"输入框：%@", S3DescribeInput(S3InputIn(vc)));
-            S3Banner(S3StatusLine(vc));
-            S3Attempt(vc, 0);
+            gAnnoWin = anno;
+            S3Log(@"──── 打开文字面板，开始（来自 %@）", S3SelfShort());
+            S3Log(@"场景体检：\n%@", S3ScenesReport());
+            gSceneVerdict = S3RepairScene(anno);
+            if (anno && !anno.isKeyWindow) [anno makeKeyAndVisible];
+            if (input && !input.isFirstResponder) {
+                BOOL ok = [input becomeFirstResponder];
+                S3Log(@"第0步：输入框抢焦点 -> %d", (int)ok);
+            }
+            NSMutableArray *tried = [NSMutableArray array];
+            if ([gSceneVerdict rangeOfString:@"已补挂"].location != NSNotFound) [tried addObject:@"补场景"];
+            gTryDesc = tried.count ? [tried componentsJoinedByString:@"+"] : @"补场景(无缺失)";
+            S3Tip(anno, S3StatusLine(vc, @"…正在尝试呼出键盘"), 6.0);
+            S3Schedule(vc, step, gen, 0.30);
             break;
         }
-        case 7:
-            S3ProbeBegin(vc);
+        case 1: {
+            NSString *dump = nil;
+            UIWindow *kb = S3FindKeyboardWindow(&dump);
+            S3Log(@"第1步：%@", dump);
+            if (kb) {
+                S3LowerAnnoUnderKeyboard(anno, kb);
+                gTryDesc = [gTryDesc stringByAppendingString:@"+降标注窗口"];
+            } else {
+                gTryDesc = [gTryDesc stringByAppendingString:@"+未找到键盘窗口"];
+            }
+            if (input && !input.isFirstResponder) [input becomeFirstResponder];
+            S3Schedule(vc, step, gen, 0.60);
             break;
-        case 8:
-            S3ProbeJudge(vc);
-            S3Banner(S3StatusLine(vc));
+        }
+        case 2: {
+            NSString *dump = nil;
+            UIWindow *kb = S3FindKeyboardWindow(&dump);
+            if (kb) {
+                S3RaiseKeyboardWindow(anno, kb);
+                gTryDesc = [gTryDesc stringByAppendingString:@"+抬键盘窗口"];
+            } else if (input) {
+                S3AttachAccessory(input);
+                [input becomeFirstResponder];
+                gTryDesc = [gTryDesc stringByAppendingString:@"+输入附件"];
+            }
+            S3Schedule(vc, step, gen, 0.60);
             break;
-        default:
-            S3Attempt(vc, step);
+        }
+        case 3: {
+            if (input) {
+                [input reloadInputViews];
+                BOOL ok = [input becomeFirstResponder];
+                S3Log(@"第3步：reloadInputViews + 重新抢焦点 -> %d", (int)ok);
+            }
+            S3Schedule(vc, step, gen, 0.60);
             break;
+        }
+        default: {
+            // 全部落空：回滚层级（判定那张图留在屏幕上给作者），gVC 不动，免得兜底定时器把图收走
+            S3Log(@"✘ 两秒内没有任何键盘通知（第 %d 步），回滚层级", step);
+            S3Log(@"最终场景清单：\n%@", S3ScenesReport());
+            S3RollbackLevels();
+            NSString *verdict = @"✘ 键盘没弹\n系统全程没发过键盘通知 →\n不是被窗口压住，是这个窗口拿不到键盘。\n请把这张图发给作者。";
+            gTryDesc = [gTryDesc stringByAppendingString:@"+全落空"];
+            UIWindow *show = gAnnoWin ? gAnnoWin : anno;
+            if (show) S3Tip(show, S3StatusLine(vc, verdict), 0);
+            break;
+        }
     }
-    S3Schedule(vc, step, gen);
 }
 
 static void S3Start(UIViewController *vc) {
@@ -466,11 +584,12 @@ static void S3Start(UIViewController *vc) {
         return;
     }
     if (!vc) return;
+    double now = [NSDate date].timeIntervalSince1970;
+    if (gVC == vc && (now - gStartAt) < 2.0) return;   // 同一面板 2 秒内只启动一次，避免双重阶梯
     gVC = vc;
+    gStartAt = now;
     gKbSeen = NO;
-    gKbFrameLogged = NO;
-    gProbeResult = 0;
-    gAnnoWindow = S3WindowForView(vc.view);
+    gAccessoryAdded = NO;
     int gen = ++gGen;
     S3Step(vc, 0, gen);
 }
@@ -494,26 +613,29 @@ static void S3InstallHook(void) {
         IMP origEnsure = method_getImplementation(mEnsure);
         IMP newImp = imp_implementationWithBlock(^(UIViewController *self) {
             UIWindow *anno = S3WindowForView(self.view);
-            if (anno && !anno.isKeyWindow) [anno makeKeyWindow];
+            // 抢焦点之前先把场景补好 —— 顺序很关键
+            if (anno && !anno.windowScene) {
+                UIWindowScene *best = S3BestScene();
+                if (best) anno.windowScene = best;
+            }
             if (origEnsure) ((void (*)(id, SEL))origEnsure)(self, selEnsure);
             S3Start(self);
         });
         method_setImplementation(mEnsure, newImp);
         S3Log(@"已 hook ensureTextKeyboard");
     } else {
-        S3Log(@"⚠️ 没有 ensureTextKeyboard 方法，改走 viewDidAppear");
+        S3Log(@"⚠️ 没有 ensureTextKeyboard，改走 viewDidAppear");
     }
 
-    SEL selAppear = NSSelectorFromString(@"viewDidAppear:");
-    Method mAppear = class_getInstanceMethod(cls, selAppear);
+    Method mAppear = class_getInstanceMethod(cls, NSSelectorFromString(@"viewDidAppear:"));
     if (mAppear) {
         IMP origAppear = method_getImplementation(mAppear);
         IMP newAppear = imp_implementationWithBlock(^(UIViewController *self, BOOL animated) {
-            if (origAppear) ((void (*)(id, SEL, BOOL))origAppear)(self, selAppear, animated);
-            S3Start(self);       // 双保险：无论 ensureTextKeyboard 有没有被调，这里一定触发
+            if (origAppear) ((void (*)(id, SEL, BOOL))origAppear)(self, @selector(viewDidAppear:), animated);
+            S3Start(self);      // 双保险：ensureTextKeyboard 万一没被调，这里一定触发
         });
         method_setImplementation(mAppear, newAppear);
-        S3Log(@"已 hook viewDidAppear:（双保险）");
+        S3Log(@"已 hook viewDidAppear:");
     }
 
     Method mDis = class_getInstanceMethod(cls, NSSelectorFromString(@"viewDidDisappear:"));
@@ -521,7 +643,8 @@ static void S3InstallHook(void) {
         IMP origDis = method_getImplementation(mDis);
         IMP newDis = imp_implementationWithBlock(^(UIViewController *self, BOOL animated) {
             if (origDis) ((void (*)(id, SEL, BOOL))origDis)(self, @selector(viewDidDisappear:), animated);
-            S3Log(@"viewDidDisappear -> 还原");
+            S3Log(@"面板消失 -> 回滚");
+            S3TipHideNow();
             S3Restore();
         });
         method_setImplementation(mDis, newDis);
@@ -529,55 +652,59 @@ static void S3InstallHook(void) {
     }
 
     gHookState = 1;
-    S3Log(@"hook 安装完成 on S3TextEditViewController（本份来自 %@）", S3SelfPath());
+    S3Log(@"hook 安装完成（本份来自 %@）", S3SelfPath());
 }
 
 __attribute__((constructor)) static void S3Init(void) {
     S3Log(@"===== v%@ 已加载 pid=%d =====", kS3Ver, getpid());
     S3Log(@"自身路径: %@", S3SelfPath());
-    NSArray<NSString *> *imgs = S3RelatedImages();
-    S3Log(@"进程内相关镜像（%lu 份，>1 就是被重复注入了）:", (unsigned long)imgs.count);
-    for (NSString *p in imgs) S3Log(@"      %@", p);
+    uint32_t n = _dyld_image_count();
+    int fix = 0;
+    NSMutableString *imgs = [NSMutableString string];
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        NSString *f = [NSString stringWithUTF8String:nm];
+        if (!f) continue;
+        if ([f containsString:@"S3TextKeyboardFix"] || [f containsString:@"biaoji"]) {
+            if ([f containsString:@"S3TextKeyboardFix.dylib"]) fix++;
+            [imgs appendFormat:@"\n      %@", f];
+        }
+    }
+    S3Log(@"进程内相关镜像（补丁 %d 份，>1 就是重复注入）:%@", fix, imgs);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         S3InstallHook();
 
-        gObservers = [NSMutableArray array];
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        // block 版观察者返回的 token 必须自己持有，否则会被立刻释放、回调根本不触发
-        [gObservers addObject:[nc addObserverForName:UIKeyboardWillShowNotification
-                                              object:nil
-                                               queue:[NSOperationQueue mainQueue]
-                                          usingBlock:^(NSNotification *n) {
+        // block 版观察者返回的 token 必须自己持有，否则立刻释放、回调根本不触发
+        static NSMutableArray *tokens = nil;
+        tokens = [NSMutableArray array];
+        [tokens addObject:[nc addObserverForName:UIKeyboardWillShowNotification
+                                          object:nil queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *note) {
             gKbSeen = YES;
-            S3Log(@"UIKeyboardWillShow 到了 frame=%@", n.userInfo[UIKeyboardFrameEndUserInfoKey]);
-            S3ShiftPanel(n, YES);
+            S3Log(@"UIKeyboardWillShow frame=%@", note.userInfo[UIKeyboardFrameEndUserInfoKey]);
         }]];
-        [gObservers addObject:[nc addObserverForName:UIKeyboardDidShowNotification
-                                              object:nil
-                                               queue:[NSOperationQueue mainQueue]
-                                          usingBlock:^(NSNotification *n) {
+        [tokens addObject:[nc addObserverForName:UIKeyboardDidShowNotification
+                                          object:nil queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *note) {
             gKbSeen = YES;
-            S3Log(@"UIKeyboardDidShow 到了：键盘确认出现");
-            if (!gKbFrameLogged) {
-                gKbFrameLogged = YES;
-                S3ShiftPanel(n, YES);
-            }
+            S3Log(@"UIKeyboardDidShow 键盘确认出现");
         }]];
-        [gObservers addObject:[nc addObserverForName:UIKeyboardDidHideNotification
-                                              object:nil
-                                               queue:[NSOperationQueue mainQueue]
-                                          usingBlock:^(NSNotification *n) {
+        [tokens addObject:[nc addObserverForName:UIKeyboardDidHideNotification
+                                          object:nil queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *note) {
             S3Log(@"UIKeyboardDidHide");
-            S3ShiftPanel(n, NO);
         }]];
 
-        // 兜底：VC 被直接销毁时还原
+        // 兜底：面板被直接销毁时回滚并收掉提示
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-            if (!gVC && !gLevelLowered) return;
+            if (!gVC && !gAnnoLowered && !gKbWinRaised) return;
             UIViewController *vc = gVC;
             if (!vc || vc.isBeingDismissed || !vc.isViewLoaded || !vc.view.window) {
                 S3Log(@"清理：文字面板已消失");
+                S3TipHideNow();
                 S3Restore();
             }
         }];
