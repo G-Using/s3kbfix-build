@@ -1,0 +1,68 @@
+name: Build DEB
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      THEOS: /home/runner/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6 xz-utils ldid || true
+          if ! command -v ldid >/dev/null 2>&1; then
+            sudo mkdir -p /usr/local/bin
+            sudo curl -fsSL --retry 3 \
+              "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64" \
+              -o /usr/local/bin/ldid
+            sudo chmod +x /usr/local/bin/ldid
+          fi
+          ldid 2>/dev/null | head -1 || true
+
+      - name: Install Theos + Linux iOS toolchain
+        run: |
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$HOME/theos"
+          if [ ! -x "$HOME/theos/toolchain/linux/iphone/bin/clang" ]; then
+            curl -sL --retry 3 \
+              "https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz" \
+              -o /tmp/toolchain.tar.xz
+            mkdir -p "$HOME/theos/toolchain"
+            tar -xJf /tmp/toolchain.tar.xz -C "$HOME/theos/toolchain/"
+          fi
+          test -x "$HOME/theos/toolchain/linux/iphone/bin/clang" \
+            && echo "toolchain OK" \
+            || { echo "toolchain missing"; exit 1; }
+
+      - name: Fetch iOS 16.5 SDK
+        run: |
+          mkdir -p "$HOME/theos/sdks"
+          if [ ! -d "$HOME/theos/sdks/iPhoneOS16.5.sdk" ]; then
+            cd "$HOME/theos/sdks"
+            curl -fsSL --retry 3 --retry-delay 5 -o sdk.tar.xz \
+              "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+            tar -xf sdk.tar.xz
+            rm -f sdk.tar.xz
+          fi
+          ls "$HOME/theos/sdks"
+
+      - name: Build package
+        run: |
+          export PATH="$HOME/theos/bin:$PATH"
+          export THEOS="$HOME/theos"
+          chmod +x layout/DEBIAN/postinst
+          ls "$THEOS/makefiles/common.mk"
+          make package FINALPACKAGE=1
+          ls -l packages
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3kbfix-deb
+          path: packages/*.deb
+          if-no-files-found: error
