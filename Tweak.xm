@@ -217,7 +217,7 @@ static NSArray<UIWindow *> *S3AllWindows(void) {
     }
     // 键盘窗口在 iOS 15+ 可能不在 UIApplication.windows 里，从各窗口的视图树里再捞一遍
     for (UIWindow *w in [all copy]) {
-        [S3CollectWindowsIn:w into:all depth:0];
+        S3CollectWindowsIn(w, all, 0);
     }
     return all;
 }
@@ -341,8 +341,8 @@ static NSString *S3ScenesReport(void) {
             continue;
         }
         UIWindowScene *ws = (UIWindowScene *)sc;
-        NSString *role = @"?";
-        @try { role = ws.session.role ?: @"nil"; } @catch (__unused NSException *e) {}
+        NSString *role = ws.session.role;
+        if (![role isKindOfClass:[NSString class]]) role = @"?";
         [s appendFormat:@"  #%d UIWindowScene act=%ld（0=前台活跃）role=%@ 窗口=%lu\n",
          i++, (long)ws.activationState, role, (unsigned long)ws.windows.count];
         for (UIWindow *w in ws.windows) {
@@ -374,21 +374,47 @@ static UIWindowScene *S3BestScene(void) {
     return any;
 }
 
-// 第 0 步：补场景。只在确实缺失时动手，别去瞎折腾已经正常的窗口。
+// 第 0 步：补场景。只在确实有问题时动手，别去瞎折腾已经正常的窗口。
 static NSString *S3RepairScene(UIWindow *anno) {
     if (!anno) return @"窗口=未找到";
     UIWindowScene *cur = anno.windowScene;
-    if (cur) {
-        return [NSString stringWithFormat:@"窗口场景=%@ act=%ld（已有，不动）",
-                NSStringFromClass([cur class]), (long)cur.activationState];
+
+    // 关键信号：如果「另一个场景」里还有窗口在当 key window，说明这个进程里存在两个
+    // 各自有 key window 的场景 —— 我们多半挂在了非主场景上，而键盘只认主场景。
+    // （同一个场景里，标注窗口拿了 key 之后，别人就不可能是 key 了。）
+    UIWindowScene *otherKeyScene = nil;
+    UIWindow *otherKeyWin = nil;
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        if (ws == cur) continue;
+        for (UIWindow *w in ws.windows) {
+            if (w.isKeyWindow && !w.isHidden) { otherKeyScene = ws; otherKeyWin = w; break; }
+        }
+        if (otherKeyScene) break;
     }
-    UIWindowScene *best = S3BestScene();
-    if (!best) return @"窗口场景=无（找不到任何可用场景！）";
-    anno.windowScene = best;
-    BOOL ok = (anno.windowScene == best);
-    S3Log(@"★ 标注窗口原本没有 windowScene，已挂到 act=%ld 的场景 -> %d", (long)best.activationState, (int)ok);
-    return [NSString stringWithFormat:@"窗口场景=原来没有 → 已补挂 act=%ld -> %d",
-            (long)best.activationState, (int)ok];
+
+    if (!cur) {
+        UIWindowScene *best = S3BestScene();
+        if (!best) return @"窗口场景=无（找不到任何可用场景！）";
+        anno.windowScene = best;
+        S3Log(@"★ 标注窗口原本没有 windowScene，已挂到 act=%ld 的场景（%d）",
+              (long)best.activationState, (int)(anno.windowScene == best));
+        return [NSString stringWithFormat:@"窗口场景=原来没有 → 已补挂 act=%ld", (long)best.activationState];
+    }
+
+    if (otherKeyScene) {
+        CGFloat oldAct = (CGFloat)cur.activationState;
+        anno.windowScene = otherKeyScene;
+        BOOL ok = (anno.windowScene == otherKeyScene);
+        S3Log(@"★ 标注窗口挂在 act=%.0f 的场景上，但另一个场景里 %@ 还是 key → 把标注窗口移过去（%d）",
+              oldAct, NSStringFromClass([otherKeyWin class]), (int)ok);
+        return [NSString stringWithFormat:@"窗口场景=挂错了，已移到 act=%ld 的场景（那边 %@ 是 key）",
+                (long)otherKeyScene.activationState, NSStringFromClass([otherKeyWin class])];
+    }
+
+    return [NSString stringWithFormat:@"窗口场景=%@ act=%ld 窗口数=%lu（不动）",
+            NSStringFromClass([cur class]), (long)cur.activationState, (unsigned long)cur.windows.count];
 }
 
 // ───────────────────────── 层级处置 ─────────────────────────
@@ -479,7 +505,7 @@ static NSString *S3StatusLine(UIViewController *vc, NSString *verdict) {
      anno ? NSStringFromClass([anno class]) : @"无", anno ? anno.windowLevel : 0,
      anno ? (int)anno.isKeyWindow : 0];
     [s appendFormat:@"输入框=%@\n", S3DescribeInput(input)];
-    [s appendFormat:@"键盘通知=%d %@\n", (int)gKbSeen, kbDump ?: @"");
+    [s appendFormat:@"键盘通知=%d %@\n", (int)gKbSeen, kbDump ? kbDump : @"");
     [s appendFormat:@"硬件键盘=%ld\n", (long)S3HardwareKeyboardMode()];
     [s appendFormat:@"场景: %@\n", gSceneVerdict];
     [s appendFormat:@"已试: %@\n", gTryDesc];
