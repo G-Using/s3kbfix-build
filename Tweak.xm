@@ -1,4 +1,4 @@
-// S3TextKeyboardFix 1.6.7 —— 让「截图标记」的文字标注面板能弹出系统原生键盘
+// S3TextKeyboardFix 1.6.8 —— 让「截图标记」的文字标注面板能弹出系统原生键盘
 //
 // ─────────────────────────────────────────────────────────────────────────
 // 一、结论先行：不要去动窗口层级
@@ -49,7 +49,7 @@
 
 #define kLogPath @"/var/mobile/Documents/S3TextKeyboardFix.log"
 
-static NSString *const kS3Ver = @"1.6.7";
+static NSString *const kS3Ver = @"1.6.8";
 
 // 最后手段才会用到的层级。正常路径完全不碰 windowLevel。
 static const CGFloat kAnnoFallbackLevel = 1.0;
