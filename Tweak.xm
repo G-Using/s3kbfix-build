@@ -175,6 +175,14 @@ static void S3OrderWindows(UIWindow *anno, NSString *why) {
 }
 
 static void S3Restore(void) {
+    // 面板随键盘上移过的话，先复位
+    if (gVC) {
+        UIView *panel = [gVC.view viewWithTag:999];
+        if (panel && !CGAffineTransformIsIdentity(panel.transform)) {
+            panel.transform = CGAffineTransformIdentity;
+            S3Log(@"还原：文字面板位置复位");
+        }
+    }
     if (gAnnoSaved) {
         UIWindow *w = gAnnoWindow;
         if (w) {
@@ -255,6 +263,26 @@ static void S3Attempt(UIViewController *vc, int attempt) {
     }
 }
 
+// 面板在屏幕底部，「取消/确认」就在最下面 —— 键盘弹出来会正好把它俩盖住。
+// 这里只对面板做 transform（不影响 biaoji 自己的布局/autoresizing），键盘收起即复位。
+static void S3ShiftPanel(NSNotification *n, BOOL up) {
+    if (!gVC) return;
+    UIView *panel = [gVC.view viewWithTag:999];
+    if (!panel) return;
+    CGFloat h = 0;
+    if (up) {
+        NSValue *v = n.userInfo[UIKeyboardFrameEndUserInfoKey];
+        if ([v isKindOfClass:[NSValue class]]) h = CGRectGetHeight([v CGRectValue]);
+        if (h <= 0 || h > 600) h = 336.0;
+    }
+    if (up && CGAffineTransformIsIdentity(panel.transform) == NO) return;
+    [UIView animateWithDuration:0.25 animations:^{
+        panel.transform = up ? CGAffineTransformMakeTranslation(0, -h)
+                             : CGAffineTransformIdentity;
+    }];
+    S3Log(@"文字面板%@ %.0f", up ? @"随键盘上移" : @"复位", h);
+}
+
 // ───────────────────── hook 安装 ─────────────────────
 static void S3InstallHook(void) {
     static int tries = 0;
@@ -318,6 +346,7 @@ __attribute__((constructor)) static void S3Init(void) {
             gKbSeen = YES;
             S3Log(@"UIKeyboardWillShow 到了 frame=%@", n.userInfo[UIKeyboardFrameEndUserInfoKey]);
             if (gAnnoWindow) S3OrderWindows(gAnnoWindow, @"键盘将显示");
+            S3ShiftPanel(n, YES);
         }]];
         [gObservers addObject:[nc addObserverForName:UIKeyboardDidShowNotification
                                               object:nil
@@ -326,12 +355,14 @@ __attribute__((constructor)) static void S3Init(void) {
             gKbSeen = YES;
             S3Log(@"UIKeyboardDidShow 到了：键盘确认可见");
             if (gAnnoWindow) S3OrderWindows(gAnnoWindow, @"键盘已显示");
+            S3ShiftPanel(n, YES);
         }]];
         [gObservers addObject:[nc addObserverForName:UIKeyboardDidHideNotification
                                               object:nil
                                                queue:[NSOperationQueue mainQueue]
                                           usingBlock:^(NSNotification *n) {
             S3Log(@"UIKeyboardDidHide");
+            S3ShiftPanel(n, NO);
         }]];
 
         // 兜底：VC 被直接 dealloc 时还原层级
