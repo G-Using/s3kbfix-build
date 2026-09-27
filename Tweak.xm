@@ -505,7 +505,7 @@ static NSString *S3StatusLine(UIViewController *vc, NSString *verdict) {
      anno ? NSStringFromClass([anno class]) : @"无", anno ? anno.windowLevel : 0,
      anno ? (int)anno.isKeyWindow : 0];
     [s appendFormat:@"输入框=%@\n", S3DescribeInput(input)];
-    [s appendFormat:@"键盘通知=%d %@\n", (int)gKbSeen, kbDump ? kbDump : @"");
+    [s appendFormat:@"键盘通知=%d %@\n", (int)gKbSeen, kbDump ? kbDump : @""];
     [s appendFormat:@"硬件键盘=%ld\n", (long)S3HardwareKeyboardMode()];
     [s appendFormat:@"场景: %@\n", gSceneVerdict];
     [s appendFormat:@"已试: %@\n", gTryDesc];
